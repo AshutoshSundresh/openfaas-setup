@@ -39,23 +39,12 @@ rget() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 log "Starting ${TRIALS} trials  gateway=${GATEWAY}  fn=${FN_NAME}  namespace=${FN_NAMESPACE}"
-
-# Read whatever counter is already in Redis before trial 1.
-# On a brand-new cluster this will be empty (counter treated as 0).
-# On a re-run it picks up where the last session left off.
-EXISTING=$(rget "artifact:${FN_NAME}:${FN_VERSION}")
-if [ -z "${EXISTING}" ]; then
-  log "No existing artifact — trial 1 will seed Redis from default (counter=0 → 1)"
-  PREV_COUNTER=0
-else
-  PREV_COUNTER=$(echo "${EXISTING}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
-  log "Existing artifact found  counter=${PREV_COUNTER}"
-fi
 echo ""
 
 # ── Pre-loop: force a fresh pod so trial 1 reads the current artifact ─────────
-# Without this, an already-running pod may have started before the last push and
-# hold a stale artifact view, causing a counter mismatch on the first trial.
+# Any already-running pod may have started before the last push and hold a stale
+# artifact in memory. Cycling it here ensures the baseline counter we read below
+# matches what the trial 1 pod will actually see at startup.
 log "PRE-LOOP: cycling pod to ensure trial 1 starts fresh..."
 kubectl delete pod -n "${FN_NAMESPACE}" -l "faas_function=${FN_NAME}" \
   --grace-period=20 2>/dev/null || true
@@ -64,6 +53,16 @@ kubectl wait --for=delete pod \
   --timeout=40s 2>/dev/null || true
 log "PRE-LOOP: waiting for replacement pod..."
 sleep 8
+
+# Read baseline AFTER the pre-loop push has landed in Redis.
+EXISTING=$(rget "artifact:${FN_NAME}:${FN_VERSION}")
+if [ -z "${EXISTING}" ]; then
+  log "No existing artifact — trial 1 will seed Redis from default (counter=0 → 1)"
+  PREV_COUNTER=0
+else
+  PREV_COUNTER=$(echo "${EXISTING}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
+  log "Baseline counter=${PREV_COUNTER} (read after pre-loop)"
+fi
 echo ""
 
 for i in $(seq 1 "${TRIALS}"); do
