@@ -1,0 +1,3 @@
+fn/target/
+*.class
+*.jar
