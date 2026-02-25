@@ -1,0 +1,18 @@
+# Strategic-merge patch applied after `faas-cli deploy` to add:
+#   1. terminationGracePeriodSeconds — gives the wrapper time to push before SIGKILL
+#   2. POD_UID via Downward API — wrapper and JVM use this as the Redis key discriminator
+#
+# Usage:
+#   kubectl patch deployment profile-fn -n openfaas-fn \
+#     --patch-file k8s/function-patch.yaml
+spec:
+  template:
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: profile-fn
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid

@@ -1,0 +1,21 @@
+version: 1.0
+
+provider:
+  name: openfaas
+  gateway: http://127.0.0.1:8080   # assumes: kubectl port-forward -n openfaas svc/gateway 8080:8080
+
+functions:
+  profile-fn:
+    lang: dockerfile
+    handler: ./fn
+    image: profile-fn:latest
+    environment:
+      FN_NAME: profile-fn
+      FN_VERSION: v1
+      REDIS_HOST: redis.openfaas.svc.cluster.local
+      REDIS_PORT: "6379"
+    labels:
+      com.openfaas.scale.min: "1"
+      com.openfaas.scale.max: "5"
+    annotations:
+      com.openfaas.ready.http.path: "/"
