@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # test_loop.sh — runs N cold-start cycles and verifies ordering invariants.
+# Ensure Scoop-installed tools (jq, redis-cli) are on PATH when run as a
+# non-interactive shell (e.g. bash scripts/test_loop.sh).
+export PATH="$PATH:/c/Users/ashut/scoop/shims"
 #
 # For each trial:
 #   1. Invoke the function (cold start if needed)
@@ -48,6 +51,19 @@ else
   PREV_COUNTER=$(echo "${EXISTING}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
   log "Existing artifact found  counter=${PREV_COUNTER}"
 fi
+echo ""
+
+# ── Pre-loop: force a fresh pod so trial 1 reads the current artifact ─────────
+# Without this, an already-running pod may have started before the last push and
+# hold a stale artifact view, causing a counter mismatch on the first trial.
+log "PRE-LOOP: cycling pod to ensure trial 1 starts fresh..."
+kubectl delete pod -n "${FN_NAMESPACE}" -l "faas_function=${FN_NAME}" \
+  --grace-period=20 2>/dev/null || true
+kubectl wait --for=delete pod \
+  -n "${FN_NAMESPACE}" -l "faas_function=${FN_NAME}" \
+  --timeout=40s 2>/dev/null || true
+log "PRE-LOOP: waiting for replacement pod..."
+sleep 8
 echo ""
 
 for i in $(seq 1 "${TRIALS}"); do

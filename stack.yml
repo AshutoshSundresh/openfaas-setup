@@ -8,7 +8,7 @@ functions:
   profile-fn:
     lang: dockerfile
     handler: ./fn
-    image: profile-fn:latest
+    image: asundresh/profile-fn:latest
     environment:
       FN_NAME: profile-fn
       FN_VERSION: v1
