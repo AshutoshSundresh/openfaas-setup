@@ -95,9 +95,15 @@ chmod +x scripts/test_loop.sh
 TRIALS=20 ./scripts/test_loop.sh
 ```
 
-The script exits `0` if every trial passes, `1` otherwise. Expected output per trial:
+The script exits `0` if every trial passes, `1` otherwise.
+
+**Trial 1 note:** Redis has no artifact yet on a fresh cluster. The wrapper logs `ARTIFACT_MISSING`, seeds a default payload (counter=0), and the first push writes counter=1. This is expected — the script detects the pre-existing counter before the loop starts and uses it as the baseline, so trial 1 passes like any other.
+
+Expected output per trial:
 
 ```
+[...] No existing artifact — trial 1 will seed Redis from default (counter=0 → 1)
+
 [...] ══ Trial 1/20 ══════
 [...] Invoking profile-fn...
 [...] pod_uid=abc123  artifact_hash=3f9a1c  runseq=1
@@ -105,7 +111,7 @@ The script exits `0` if every trial passes, `1` otherwise. Expected output per t
 [...] Deleting pod profile-fn-xxxx (grace=20s)...
 [...] Waiting for pod termination...
 [...] terminated key present: {"pod":"abc123","terminated_ms":...}
-[...] artifact counter=1  last_writer=abc123
+[...] artifact counter=1 (expected 1)  last_writer=abc123
 [...] Trial 1: PASS
 ```
 
@@ -139,7 +145,7 @@ redis-cli GET runseq:profile-fn:v1
 | `TERM_HANDLER_START` | `entrypoint.sh` | Wrapper caught SIGTERM, starting push |
 | `POST_PUSH_DONE` | `entrypoint.sh` | Artifact pushed to Redis |
 
-The next cold start will read the artifact written by the previous instance — the incrementing `counter` field in Redis is the chain-of-custody proof.
+From trial 2 onward, each cold start reads the artifact written by the previous instance. The test script verifies `counter == prev + 1` on every trial — that monotonic increment is the chain-of-custody proof. Trial 1 bootstraps the chain from a default payload, which is expected and not a failure.
 
 ---
 

@@ -36,6 +36,18 @@ rget() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 log "Starting ${TRIALS} trials  gateway=${GATEWAY}  fn=${FN_NAME}  namespace=${FN_NAMESPACE}"
+
+# Read whatever counter is already in Redis before trial 1.
+# On a brand-new cluster this will be empty (counter treated as 0).
+# On a re-run it picks up where the last session left off.
+EXISTING=$(rget "artifact:${FN_NAME}:${FN_VERSION}")
+if [ -z "${EXISTING}" ]; then
+  log "No existing artifact — trial 1 will seed Redis from default (counter=0 → 1)"
+  PREV_COUNTER=0
+else
+  PREV_COUNTER=$(echo "${EXISTING}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
+  log "Existing artifact found  counter=${PREV_COUNTER}"
+fi
 echo ""
 
 for i in $(seq 1 "${TRIALS}"); do
@@ -101,9 +113,16 @@ for i in $(seq 1 "${TRIALS}"); do
     log "FAIL: artifact key missing after termination"
     TRIAL_PASS=false
   else
-    NEW_COUNTER=$(echo "${ARTIFACT}" | jq -r '.counter // "?"' 2>/dev/null || echo "?")
+    NEW_COUNTER=$(echo "${ARTIFACT}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
     LAST_WRITER=$(echo "${ARTIFACT}" | jq -r '.last_writer_pod // "?"' 2>/dev/null || echo "?")
-    log "artifact counter=${NEW_COUNTER}  last_writer=${LAST_WRITER}"
+    EXPECTED_COUNTER=$((PREV_COUNTER + 1))
+    if [ "${NEW_COUNTER}" -ne "${EXPECTED_COUNTER}" ]; then
+      log "FAIL: counter not incremented  expected=${EXPECTED_COUNTER}  got=${NEW_COUNTER}"
+      TRIAL_PASS=false
+    else
+      log "artifact counter=${NEW_COUNTER} (expected ${EXPECTED_COUNTER})  last_writer=${LAST_WRITER}"
+      PREV_COUNTER="${NEW_COUNTER}"
+    fi
   fi
 
   if ${TRIAL_PASS}; then
