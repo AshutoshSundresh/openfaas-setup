@@ -8,6 +8,10 @@ functions:
   profile-fn:
     lang: dockerfile
     handler: ./fn
+    # Pre-built public image — works as-is for running the demo.
+    # To make changes: docker build -t <your-user>/profile-fn:latest ./fn
+    #                  docker push <your-user>/profile-fn:latest
+    #                  then update this line.
     image: asundresh/profile-fn:latest
     environment:
       FN_NAME: profile-fn

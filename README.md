@@ -65,6 +65,10 @@ sudo apt-get install -y jq redis-tools   # Debian/Ubuntu
 
 ### 1. Create a local cluster
 
+**Windows:** kind fails on Windows Git Bash due to a cgroup issue. Use Docker Desktop's built-in Kubernetes instead: open Docker Desktop → Settings → Kubernetes → Enable Kubernetes → Apply & Restart. No CLI command needed.
+
+**macOS / Linux:**
+
 ```bash
 # kind
 kind create cluster --name openfaas
@@ -86,35 +90,37 @@ helm upgrade --install openfaas openfaas/openfaas \
   --set generateBasicAuth=true
 ```
 
-Retrieve the admin password and log in:
-
-```bash
-PASSWORD=$(kubectl -n openfaas get secret basic-auth -o jsonpath='{.data.basic-auth-password}' | base64 --decode)
-echo $PASSWORD | faas-cli login --username admin --password-stdin --gateway http://127.0.0.1:8080
-```
-
 ### 3. Deploy Redis
 
 ```bash
 kubectl apply -f k8s/redis.yaml
 ```
 
-### 4. Build and deploy the function
+### 4. Deploy the function
+
+`stack.yml` references a pre-built public image (`asundresh/profile-fn:latest`) so you can deploy straight away without building anything:
 
 ```bash
-# Build the image (runs inside the cluster's Docker context for kind/k3d)
-docker build -t profile-fn:latest ./fn
+# Log in to the OpenFaaS gateway (keep the port-forward from step 2 running)
+PASSWORD=$(kubectl -n openfaas get secret basic-auth -o jsonpath='{.data.basic-auth-password}' | base64 --decode)
+echo $PASSWORD | faas-cli login --username admin --password-stdin --gateway http://127.0.0.1:8080
 
-# For kind: load the image into the cluster (skips a registry)
-kind load docker-image profile-fn:latest --name openfaas
-
-# Deploy via OpenFaaS
+# Deploy — must be run from the repo root
 faas-cli deploy -f stack.yml
 
 # Patch the Deployment to add grace period + POD_UID downward API
 kubectl patch deployment profile-fn -n openfaas-fn \
   --patch-file k8s/function-patch.yaml
 ```
+
+**If you want to modify the function and push your own image:**
+
+```bash
+docker build -t <your-dockerhub-username>/profile-fn:latest ./fn
+docker push <your-dockerhub-username>/profile-fn:latest
+```
+
+Then update the `image:` line in `stack.yml` to match and redeploy. OpenFaaS CE only accepts public registry images, so the repository must be public on Docker Hub (or another public registry).
 
 ---
 

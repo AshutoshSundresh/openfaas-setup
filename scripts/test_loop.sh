@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 # test_loop.sh — runs N cold-start cycles and verifies ordering invariants.
-# Ensure Scoop-installed tools (jq, redis-cli) are on PATH when run as a
-# non-interactive shell (e.g. bash scripts/test_loop.sh).
-export PATH="$PATH:/c/Users/ashut/scoop/shims"
 #
 # For each trial:
 #   1. Invoke the function (cold start if needed)
@@ -15,6 +12,18 @@ export PATH="$PATH:/c/Users/ashut/scoop/shims"
 #   TRIALS=20 GATEWAY=http://127.0.0.1:8080 ./scripts/test_loop.sh
 
 set -euo pipefail
+
+# Pre-flight: verify required tools are on PATH
+MISSING=()
+for tool in kubectl curl jq redis-cli; do
+  command -v "${tool}" &>/dev/null || MISSING+=("${tool}")
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+  echo "ERROR: missing required tools: ${MISSING[*]}"
+  echo "Install them and ensure they are on PATH before running this script."
+  echo "See README.md for installation instructions."
+  exit 1
+fi
 
 GATEWAY="${GATEWAY:-http://127.0.0.1:8080}"
 FN_NAME="${FN_NAME:-profile-fn}"
