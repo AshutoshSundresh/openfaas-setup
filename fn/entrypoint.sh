@@ -12,14 +12,52 @@ IN_PROFILE="${PROFILE_DIR}/in.profile"
 OUT_PROFILE="${PROFILE_DIR}/out.profile"
 ARTIFACT_KEY="artifact:${FN_NAME}:${FN_VERSION}"
 TERMINATED_KEY="terminated:${POD_UID}"
+JAVA_DRAIN_S=10   # bounded wait for JVM shutdown before forced SIGKILL
 
-log() {
-  echo "[$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)] $*"
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)] $*"; }
+rcmd() { redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" "$@"; }
+
+# ── SIGTERM HANDLER (installed FIRST, before any blocking work) ───────────────
+JAVA_PID=""
+ARTIFACT=""
+
+_term() {
+  log "TERM_HANDLER_START pod=${POD_UID} t=$(date -u +%s%3N)"
+
+  # Phase 1: signal JVM, give it bounded time to flush to disk
+  if [ -n "${JAVA_PID}" ]; then
+    kill -TERM "${JAVA_PID}" 2>/dev/null || true
+    for _ in $(seq 1 "${JAVA_DRAIN_S}"); do
+      kill -0 "${JAVA_PID}" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL "${JAVA_PID}" 2>/dev/null || true   # force if still alive
+    wait "${JAVA_PID}"       2>/dev/null || true
+  fi
+
+  # Phase 2: push artifact (JVM has exited, files are stable)
+  NOW_MS=$(date -u +%s%3N)
+  if [ -f "${OUT_PROFILE}" ]; then
+    PUSH_PAYLOAD=$(cat "${OUT_PROFILE}")
+  else
+    COUNTER=$(printf '%s' "${ARTIFACT}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
+    COUNTER=$((COUNTER + 1))
+    PUSH_PAYLOAD=$(jq -n \
+      --arg  pod "${POD_UID}" \
+      --argjson ms  "${NOW_MS}" \
+      --argjson cnt "${COUNTER}" \
+      '{"version":"v1","last_writer_pod":$pod,"write_time_ms":$ms,"counter":$cnt,"notes":"pushed_by_wrapper"}')
+  fi
+
+  rcmd SET "${ARTIFACT_KEY}"   "${PUSH_PAYLOAD}"
+  rcmd SET "${TERMINATED_KEY}" \
+    "$(jq -n --arg pod "${POD_UID}" --argjson ms "${NOW_MS}" \
+        '{"pod":$pod,"terminated_ms":$ms}')"
+
+  log "POST_PUSH_DONE pod=${POD_UID} t=$(date -u +%s%3N)"
 }
 
-rcmd() {
-  redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" "$@"
-}
+trap '_term' SIGTERM SIGINT
 
 # ── PRE-PULL ──────────────────────────────────────────────────────────────────
 mkdir -p "${PROFILE_DIR}"
@@ -33,43 +71,6 @@ fi
 
 printf '%s' "${ARTIFACT}" > "${IN_PROFILE}"
 log "PRE_PULL_DONE pod=${POD_UID} t=$(date -u +%s%3N)"
-
-# ── SIGTERM HANDLER ───────────────────────────────────────────────────────────
-JAVA_PID=""
-
-_term() {
-  log "TERM_HANDLER_START pod=${POD_UID} t=$(date -u +%s%3N)"
-
-  NOW_MS=$(date -u +%s%3N)
-
-  # Prefer artifact the JVM may have written; fall back to incrementing what we pulled
-  if [ -f "${OUT_PROFILE}" ]; then
-    PUSH_PAYLOAD=$(cat "${OUT_PROFILE}")
-  else
-    COUNTER=$(printf '%s' "${ARTIFACT}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
-    COUNTER=$((COUNTER + 1))
-    PUSH_PAYLOAD=$(jq -n \
-      --arg  pod "${POD_UID}" \
-      --argjson ms  "${NOW_MS}" \
-      --argjson cnt "${COUNTER}" \
-      '{"version":"v1","last_writer_pod":$pod,"write_time_ms":$ms,"counter":$cnt,"notes":"pushed_by_wrapper"}')
-  fi
-
-  rcmd SET "${ARTIFACT_KEY}"  "${PUSH_PAYLOAD}"
-  rcmd SET "${TERMINATED_KEY}" \
-    "$(jq -n --arg pod "${POD_UID}" --argjson ms "${NOW_MS}" \
-        '{"pod":$pod,"terminated_ms":$ms}')"
-
-  log "POST_PUSH_DONE pod=${POD_UID} t=${NOW_MS}"
-
-  # Forward to JVM and wait for clean exit
-  if [ -n "${JAVA_PID}" ]; then
-    kill -TERM "${JAVA_PID}" 2>/dev/null || true
-    wait "${JAVA_PID}"           2>/dev/null || true
-  fi
-}
-
-trap '_term' SIGTERM SIGINT
 
 # ── START JVM ────────────────────────────────────────────────────────────────
 log "JAVA_STARTING pod=${POD_UID} t=$(date -u +%s%3N)"
