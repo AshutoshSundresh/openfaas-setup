@@ -9,10 +9,14 @@ COPY src ./src
 RUN mvn package -q -DskipTests
 
 # ── Stage 2: minimal runtime ──────────────────────────────────────────────────
-FROM eclipse-temurin:11-jre-alpine
+# jdk25-custom is Ubuntu 24.04 (glibc) — do NOT use Alpine (musl incompatible)
+FROM asundresh/jdk25-custom
 
 # redis-cli for wrapper pull/push; jq for JSON manipulation in entrypoint.sh
-RUN apk add --no-cache bash redis jq
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        redis-tools \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /build/target/function.jar .
