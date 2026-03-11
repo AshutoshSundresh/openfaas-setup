@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# test_loop.sh — runs N cold-start cycles and verifies ordering invariants.
+# test_loop.sh — runs N cold-start cycles and verifies MDOX profile ordering.
 #
 # For each trial:
 #   1. Invoke the function (cold start if needed)
-#   2. Verify Redis has a `started:<podUID>` key
-#   3. Delete the pod (triggers SIGTERM → wrapper push)
+#   2. Verify Redis has a `started:<podUID>` key with profile metadata
+#   3. Delete the pod (triggers SIGTERM → JVM dumps MDOX → wrapper pushes to Redis)
 #   4. Wait for pod to fully terminate
-#   5. Verify Redis has `terminated:<podUID>` and an updated artifact
+#   5. Verify Redis has `terminated:<podUID>` and an MDOX artifact
+#   6. On trial 2+, verify the new pod loaded the previous profile
 #
 # Usage:
 #   TRIALS=20 GATEWAY=http://127.0.0.1:8080 ./scripts/test_loop.sh
@@ -33,6 +34,7 @@ REDIS_HOST="${REDIS_HOST:-127.0.0.1}"   # assumes: kubectl port-forward svc/redi
 REDIS_PORT="${REDIS_PORT:-6379}"
 FN_VERSION="${FN_VERSION:-v1}"
 GRACE_EXTRA_S=5   # extra seconds to wait after pod gone before checking Redis
+ARTIFACT_KEY="artifact:${FN_NAME}:${FN_VERSION}"
 
 PASS=0
 FAIL=0
@@ -50,10 +52,7 @@ rget() {
 log "Starting ${TRIALS} trials  gateway=${GATEWAY}  fn=${FN_NAME}  namespace=${FN_NAMESPACE}"
 echo ""
 
-# ── Pre-loop: force a fresh pod so trial 1 reads the current artifact ─────────
-# Any already-running pod may have started before the last push and hold a stale
-# artifact in memory. Cycling it here ensures the baseline counter we read below
-# matches what the trial 1 pod will actually see at startup.
+# ── Pre-loop: force a fresh pod so trial 1 starts clean ──────────────────────
 log "PRE-LOOP: cycling pod to ensure trial 1 starts fresh..."
 kubectl delete pod -n "${FN_NAMESPACE}" -l "faas_function=${FN_NAME}" \
   --grace-period=20 2>/dev/null || true
@@ -63,16 +62,12 @@ kubectl wait --for=delete pod \
 log "PRE-LOOP: waiting for replacement pod..."
 sleep 8
 
-# Read baseline AFTER the pre-loop push has landed in Redis.
-EXISTING=$(rget "artifact:${FN_NAME}:${FN_VERSION}")
-if [ -z "${EXISTING}" ]; then
-  log "No existing artifact — trial 1 will seed Redis from default (counter=0 → 1)"
-  PREV_COUNTER=0
-else
-  PREV_COUNTER=$(echo "${EXISTING}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
-  log "Baseline counter=${PREV_COUNTER} (read after pre-loop)"
-fi
+# Check if there's an existing profile in Redis
+EXISTING_SIZE=$(redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" STRLEN "${ARTIFACT_KEY}" 2>/dev/null || echo "0")
+log "Baseline: existing artifact size=${EXISTING_SIZE} bytes in Redis"
 echo ""
+
+PREV_PROFILE_SIZE=0
 
 for i in $(seq 1 "${TRIALS}"); do
   log "══ Trial ${i}/${TRIALS} ══════════════════════════════════════════"
@@ -89,10 +84,12 @@ for i in $(seq 1 "${TRIALS}"); do
   fi
   log "Response: ${RESPONSE}"
 
-  POD_UID=$(echo "${RESPONSE}"      | jq -r '.pod'           2>/dev/null || echo "unknown")
-  ARTIFACT_HASH=$(echo "${RESPONSE}" | jq -r '.artifact_hash' 2>/dev/null || echo "unknown")
-  RUNSEQ=$(echo "${RESPONSE}"       | jq -r '.runseq'        2>/dev/null || echo "?")
-  log "pod_uid=${POD_UID}  artifact_hash=${ARTIFACT_HASH}  runseq=${RUNSEQ}"
+  POD_UID=$(echo "${RESPONSE}"        | jq -r '.pod'            2>/dev/null || echo "unknown")
+  PROFILE_HASH=$(echo "${RESPONSE}"   | jq -r '.profile_hash'   2>/dev/null || echo "none")
+  PROFILE_SIZE=$(echo "${RESPONSE}"   | jq -r '.profile_size'   2>/dev/null || echo "0")
+  PROFILE_LOADED=$(echo "${RESPONSE}" | jq -r '.profile_loaded' 2>/dev/null || echo "false")
+  RUNSEQ=$(echo "${RESPONSE}"         | jq -r '.runseq'         2>/dev/null || echo "?")
+  log "pod_uid=${POD_UID}  profile_hash=${PROFILE_HASH}  profile_size=${PROFILE_SIZE}  profile_loaded=${PROFILE_LOADED}  runseq=${RUNSEQ}"
 
   # ── 2. Verify started key ──────────────────────────────────────────────────
   STARTED=$(rget "started:${POD_UID}")
@@ -103,6 +100,16 @@ for i in $(seq 1 "${TRIALS}"); do
     continue
   fi
   log "started key present: ${STARTED}"
+
+  # ── 2b. Verify profile was loaded on trial 2+ ─────────────────────────────
+  if [ "${i}" -gt 1 ] && [ "${PREV_PROFILE_SIZE}" -gt 0 ]; then
+    if [ "${PROFILE_LOADED}" != "true" ]; then
+      log "FAIL: trial ${i} should have loaded profile from previous run (prev_size=${PREV_PROFILE_SIZE})"
+      TRIAL_PASS=false
+    else
+      log "profile loaded from previous run: hash=${PROFILE_HASH} size=${PROFILE_SIZE}"
+    fi
+  fi
 
   # ── 3. Find and delete the pod ────────────────────────────────────────────
   POD=$(kubectl get pod -n "${FN_NAMESPACE}" \
@@ -132,27 +139,41 @@ for i in $(seq 1 "${TRIALS}"); do
     log "terminated key present: ${TERMINATED}"
   fi
 
-  ARTIFACT=$(rget "artifact:${FN_NAME}:${FN_VERSION}")
-  if [ -z "${ARTIFACT}" ]; then
-    log "FAIL: artifact key missing after termination"
+  # Verify MDOX artifact was pushed to Redis (stored as base64)
+  NEW_ARTIFACT_B64_LEN=$(redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" STRLEN "${ARTIFACT_KEY}" 2>/dev/null || echo "0")
+  if [ "${NEW_ARTIFACT_B64_LEN}" -eq 0 ]; then
+    log "FAIL: artifact key missing or empty after termination"
     TRIAL_PASS=false
   else
-    NEW_COUNTER=$(echo "${ARTIFACT}" | jq -r '.counter // 0' 2>/dev/null || echo "0")
-    LAST_WRITER=$(echo "${ARTIFACT}" | jq -r '.last_writer_pod // "?"' 2>/dev/null || echo "?")
-    EXPECTED_COUNTER=$((PREV_COUNTER + 1))
-    if [ "${NEW_COUNTER}" -ne "${EXPECTED_COUNTER}" ]; then
-      log "FAIL: counter not incremented  expected=${EXPECTED_COUNTER}  got=${NEW_COUNTER}"
-      TRIAL_PASS=false
-    else
-      log "artifact counter=${NEW_COUNTER} (expected ${EXPECTED_COUNTER})  last_writer=${LAST_WRITER}"
-      PREV_COUNTER="${NEW_COUNTER}"
+    # base64 inflates ~33%, so real binary size ≈ b64_len * 3/4
+    APPROX_BINARY_SIZE=$(( NEW_ARTIFACT_B64_LEN * 3 / 4 ))
+    log "artifact base64_len=${NEW_ARTIFACT_B64_LEN}  approx_binary=${APPROX_BINARY_SIZE} bytes in Redis"
+    # An MDOX profile header is ~30 bytes minimum; base64 of that is ~44+ chars
+    if [ "${NEW_ARTIFACT_B64_LEN}" -lt 40 ]; then
+      # Could be "__EMPTY__" marker (first trial with no prior profile)
+      RAW_VAL=$(redis-cli -h "${REDIS_HOST}" -p "${REDIS_PORT}" --raw GET "${ARTIFACT_KEY}" 2>/dev/null || true)
+      if [ "${RAW_VAL}" = "__EMPTY__" ]; then
+        log "artifact is __EMPTY__ marker (first run, no JIT data yet)"
+      else
+        log "WARN: artifact suspiciously small (${NEW_ARTIFACT_B64_LEN} chars b64), may not be valid MDOX"
+      fi
     fi
   fi
+
+  # Check metadata key
+  META=$(rget "meta:${ARTIFACT_KEY}")
+  if [ -n "${META}" ]; then
+    META_SIZE=$(echo "${META}" | jq -r '.mdox_size // 0' 2>/dev/null || echo "0")
+    META_WRITER=$(echo "${META}" | jq -r '.last_writer_pod // "?"' 2>/dev/null || echo "?")
+    log "meta: writer=${META_WRITER} mdox_size=${META_SIZE}"
+  fi
+
+  PREV_PROFILE_SIZE="${NEW_ARTIFACT_B64_LEN}"
 
   if ${TRIAL_PASS}; then
     log "Trial ${i}: PASS"
     PASS=$((PASS+1))
-    RESULTS+=("trial=${i} PASS pod=${POD_UID} runseq=${RUNSEQ} hash=${ARTIFACT_HASH}")
+    RESULTS+=("trial=${i} PASS pod=${POD_UID} runseq=${RUNSEQ} profile_hash=${PROFILE_HASH} profile_loaded=${PROFILE_LOADED} artifact_b64_len=${NEW_ARTIFACT_B64_LEN}")
   else
     FAIL=$((FAIL+1))
     RESULTS+=("trial=${i} FAIL pod=${POD_UID}")

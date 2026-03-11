@@ -1,6 +1,7 @@
 # Strategic-merge patch applied after `faas-cli deploy` to add:
-#   1. terminationGracePeriodSeconds — gives the wrapper time to push before SIGKILL
+#   1. terminationGracePeriodSeconds — gives the wrapper time to dump + push before SIGKILL
 #   2. POD_UID via Downward API — wrapper and JVM use this as the Redis key discriminator
+#   3. emptyDir volume for MDOX profile checkpoint files
 #
 # Usage:
 #   kubectl patch deployment profile-fn -n openfaas-fn \
@@ -9,6 +10,9 @@ spec:
   template:
     spec:
       terminationGracePeriodSeconds: 20
+      volumes:
+        - name: profiles
+          emptyDir: {}
       containers:
         - name: profile-fn
           env:
@@ -16,3 +20,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.uid
+          volumeMounts:
+            - name: profiles
+              mountPath: /profiles
